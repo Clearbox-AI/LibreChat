@@ -11,6 +11,10 @@
 
 services:
   api:
+    volumes:
+    - type: bind
+      source: ./librechat.yaml
+      target: /app/librechat.yaml
     image: replica-librechat # to use a local build of librechat with different icons
 
   mongodb:
