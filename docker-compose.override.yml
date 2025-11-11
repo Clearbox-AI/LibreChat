@@ -16,6 +16,8 @@ services:
       source: ./librechat.yaml
       target: /app/librechat.yaml
     image: replica-librechat # to use a local build of librechat with different icons
+    environment:
+      - MONGO_URI=${MONGO_URI}
 
   mongodb:
     image: mongo:4.4.18
