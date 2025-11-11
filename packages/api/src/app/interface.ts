@@ -41,6 +41,7 @@ export async function loadDefaultInterface({
     privacyPolicy: interfaceConfig?.privacyPolicy ?? defaults.privacyPolicy,
     termsOfService: interfaceConfig?.termsOfService ?? defaults.termsOfService,
     mcpServers: interfaceConfig?.mcpServers ?? defaults.mcpServers,
+    defaultEnabledMcpTools: interfaceConfig?.defaultEnabledMcpTools ?? defaults.defaultEnabledMcpTools,
     customWelcome: interfaceConfig?.customWelcome ?? defaults.customWelcome,
 
     // Permissions - only include if explicitly configured
