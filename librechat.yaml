@@ -1,0 +1,92 @@
+# For more information, see the Configuration Guide:
+# https://www.librechat.ai/docs/configuration/librechat_yaml
+
+# Configuration version (required)
+version: 1.2.8
+# This setting caches the config file for faster loading across app lifecycle
+cache: false # slower, but could cause less problems to end clients when we update the site
+
+mcpServers:
+  # File system access
+  replica:
+    type: sse
+    url: http://172.18.0.1:8080/sse
+
+endpoints:
+  agents:
+    recursionLimit: 50
+    maxRecursionLimit: 100
+    disableBuilder: false
+    # (optional) File citation configuration for file_search capability
+    maxCitations: 30          # Maximum total citations in responses (1-50)
+    maxCitationsPerFile: 7    # Maximum citations from each file (1-10)
+    minRelevanceScore: 0.45   # Minimum relevance score threshold (0.0-1.0)
+    capabilities:
+      - "execute_code"
+      - "file_search"
+      - "actions"
+      - "tools"
+#      - "artifacts" # disable artifacts
+      - "ocr"
+      - "chain"
+      - "web_search"
+      - "context"
+  anthropic:
+    capabilities:
+      - "execute_code"
+      - "file_search"
+      - "actions"
+      - "tools"
+#      - "artifacts" # disable artifacts
+      - "ocr"
+      - "chain"
+      - "web_search"
+      - "context"
+
+
+registration:
+  allowedDomains:
+    - "clearbox.ai"
+    - "omc.com"
+
+
+interface:
+#  mcpServers:
+#    placeholder: "MCP Servers"
+#  privacyPolicy:
+#    externalUrl: "https://example.com/privacy"
+#    openNewTab: true
+#  termsOfService:
+#    externalUrl: "https://example.com/terms"
+#    openNewTab: true
+#    modalAcceptance: true
+#    modalTitle: "Terms of Service"
+#    modalContent: |
+#      # Terms of Service
+#      ## Introduction
+#      Welcome to LibreChat!
+  modelSelect: true
+  parameters: false
+  sidePanel: false
+  presets: false
+  prompts: false
+  bookmarks: false
+  multiConvo: false
+  agents: false
+#  customWelcome: "Hey {{user.name}}! Welcome to LibreChat"
+  runCode: false
+  webSearch: false
+  fileSearch: false
+  fileCitations: false
+  defaultEnabledMcpTools:
+    - "replica"
+
+
+# disable file upload
+fileConfig:
+  endpoints:
+    anthropic:
+      disabled: true
+
+
+
