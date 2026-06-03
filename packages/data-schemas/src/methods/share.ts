@@ -4,6 +4,7 @@ import type { FilterQuery, Model } from 'mongoose';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type * as t from '~/types';
 import logger from '~/config/winston';
+import { activeExpirationFilter } from '~/utils/retention';
 
 class ShareServiceError extends Error {
   code: string;
@@ -82,6 +83,77 @@ function anonymizeMessages(messages: t.IMessage[], newConvoId: string): t.IMessa
   });
 }
 
+/**
+ * Filter messages up to and including the target message (branch-specific)
+ * Similar to getMessagesUpToTargetLevel from fork utilities
+ */
+function getMessagesUpToTarget(messages: t.IMessage[], targetMessageId: string): t.IMessage[] {
+  if (!messages || messages.length === 0) {
+    return [];
+  }
+
+  // If only one message and it's the target, return it
+  if (messages.length === 1 && messages[0]?.messageId === targetMessageId) {
+    return messages;
+  }
+
+  // Create a map of parentMessageId to children messages
+  const parentToChildrenMap = new Map<string, t.IMessage[]>();
+  for (const message of messages) {
+    const parentId = message.parentMessageId || Constants.NO_PARENT;
+    if (!parentToChildrenMap.has(parentId)) {
+      parentToChildrenMap.set(parentId, []);
+    }
+    parentToChildrenMap.get(parentId)?.push(message);
+  }
+
+  // Find the target message
+  const targetMessage = messages.find((msg) => msg.messageId === targetMessageId);
+  if (!targetMessage) {
+    // If target not found, return all messages for backwards compatibility
+    return messages;
+  }
+
+  const visited = new Set<string>();
+  const rootMessages = parentToChildrenMap.get(Constants.NO_PARENT) || [];
+  let currentLevel = rootMessages.length > 0 ? [...rootMessages] : [targetMessage];
+  const results = new Set<t.IMessage>(currentLevel);
+
+  // Check if the target message is at the root level
+  if (
+    currentLevel.some((msg) => msg.messageId === targetMessageId) &&
+    targetMessage.parentMessageId === Constants.NO_PARENT
+  ) {
+    return Array.from(results);
+  }
+
+  // Iterate level by level until the target is found
+  let targetFound = false;
+  while (!targetFound && currentLevel.length > 0) {
+    const nextLevel: t.IMessage[] = [];
+    for (const node of currentLevel) {
+      if (visited.has(node.messageId)) {
+        continue;
+      }
+      visited.add(node.messageId);
+      const children = parentToChildrenMap.get(node.messageId) || [];
+      for (const child of children) {
+        if (visited.has(child.messageId)) {
+          continue;
+        }
+        nextLevel.push(child);
+        results.add(child);
+        if (child.messageId === targetMessageId) {
+          targetFound = true;
+        }
+      }
+    }
+    currentLevel = nextLevel;
+  }
+
+  return Array.from(results);
+}
+
 /** Factory function that takes mongoose instance and returns the methods */
 export function createShareMethods(mongoose: typeof import('mongoose')) {
   /**
@@ -90,7 +162,11 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
   async function getSharedMessages(shareId: string): Promise<t.SharedMessagesResult | null> {
     try {
       const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
-      const share = (await SharedLink.findOne({ shareId, isPublic: true })
+      const share = (await SharedLink.findOne({
+        shareId,
+        isPublic: true,
+        ...activeExpirationFilter<t.ISharedLink>(),
+      })
         .populate({
           path: 'messages',
           select: '-_id -__v -user',
@@ -102,6 +178,12 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         return null;
       }
 
+      /** Filtered messages based on targetMessageId if present (branch-specific sharing) */
+      let messagesToShare: t.IMessage[] = share.messages;
+      if (share.targetMessageId) {
+        messagesToShare = getMessagesUpToTarget(share.messages, share.targetMessageId);
+      }
+
       const newConvoId = anonymizeConvoId(share.conversationId);
       const result: t.SharedMessagesResult = {
         shareId: share.shareId || shareId,
@@ -110,7 +192,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         createdAt: share.createdAt,
         updatedAt: share.updatedAt,
         conversationId: newConvoId,
-        messages: anonymizeMessages(share.messages, newConvoId),
+        messages: anonymizeMessages(messagesToShare, newConvoId),
       };
 
       return result;
@@ -138,7 +220,11 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
     try {
       const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
       const Conversation = mongoose.models.Conversation as SchemaWithMeiliMethods;
-      const query: FilterQuery<t.ISharedLink> = { user, isPublic };
+      const query: FilterQuery<t.ISharedLink> = {
+        user,
+        isPublic,
+        ...activeExpirationFilter<t.ISharedLink>(),
+      };
 
       if (pageParam) {
         if (sortDirection === 'desc') {
@@ -234,11 +320,41 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
   }
 
   /**
+   * Delete shared links by conversation ID
+   */
+  async function deleteConvoSharedLink(
+    user: string,
+    conversationId: string,
+  ): Promise<t.DeleteAllSharesResult> {
+    if (!user || !conversationId) {
+      throw new ShareServiceError('Missing required parameters', 'INVALID_PARAMS');
+    }
+
+    try {
+      const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
+      const result = await SharedLink.deleteMany({ user, conversationId });
+      return {
+        message: 'Shared links deleted successfully',
+        deletedCount: result.deletedCount,
+      };
+    } catch (error) {
+      logger.error('[deleteConvoSharedLink] Error deleting shared links', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        user,
+        conversationId,
+      });
+      throw new ShareServiceError('Error deleting shared links', 'SHARE_DELETE_ERROR');
+    }
+  }
+
+  /**
    * Create a new shared link for a conversation
    */
   async function createSharedLink(
     user: string,
     conversationId: string,
+    targetMessageId?: string,
+    expiredAt?: Date,
   ): Promise<t.CreateShareResult> {
     if (!user || !conversationId) {
       throw new ShareServiceError('Missing required parameters', 'INVALID_PARAMS');
@@ -249,7 +365,13 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
       const Conversation = mongoose.models.Conversation as SchemaWithMeiliMethods;
 
       const [existingShare, conversationMessages] = await Promise.all([
-        SharedLink.findOne({ conversationId, user, isPublic: true })
+        SharedLink.findOne({
+          conversationId,
+          user,
+          isPublic: true,
+          ...activeExpirationFilter<t.ISharedLink>(),
+          ...(targetMessageId && { targetMessageId }),
+        })
           .select('-_id -__v -user')
           .lean() as Promise<t.ISharedLink | null>,
         Message.find({ conversationId, user }).sort({ createdAt: 1 }).lean(),
@@ -259,10 +381,15 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         logger.error('[createSharedLink] Share already exists', {
           user,
           conversationId,
+          targetMessageId,
         });
         throw new ShareServiceError('Share already exists', 'SHARE_EXISTS');
       } else if (existingShare) {
-        await SharedLink.deleteOne({ conversationId, user });
+        await SharedLink.deleteOne({
+          conversationId,
+          user,
+          ...(targetMessageId && { targetMessageId }),
+        });
       }
 
       const conversation = (await Conversation.findOne({ conversationId, user }).lean()) as {
@@ -291,9 +418,11 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         messages: conversationMessages,
         title,
         user,
+        ...(targetMessageId && { targetMessageId }),
+        ...(expiredAt && { expiredAt }),
       });
 
-      return { shareId, conversationId };
+      return { shareId, conversationId, targetMessageId };
     } catch (error) {
       if (error instanceof ShareServiceError) {
         throw error;
@@ -302,6 +431,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         error: error instanceof Error ? error.message : 'Unknown error',
         user,
         conversationId,
+        targetMessageId,
       });
       throw new ShareServiceError('Error creating shared link', 'SHARE_CREATE_ERROR');
     }
@@ -320,15 +450,25 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
 
     try {
       const SharedLink = mongoose.models.SharedLink as Model<t.ISharedLink>;
-      const share = (await SharedLink.findOne({ conversationId, user, isPublic: true })
-        .select('shareId -_id')
-        .lean()) as { shareId?: string } | null;
+      const share = (await SharedLink.findOne({
+        conversationId,
+        user,
+        isPublic: true,
+        ...activeExpirationFilter<t.ISharedLink>(),
+      })
+        .select('shareId targetMessageId -_id')
+        .sort({ updatedAt: -1 })
+        .lean()) as { shareId?: string; targetMessageId?: string } | null;
 
       if (!share) {
         return { shareId: null, success: false };
       }
 
-      return { shareId: share.shareId || null, success: true };
+      return {
+        shareId: share.shareId || null,
+        targetMessageId: share.targetMessageId,
+        success: true,
+      };
     } catch (error) {
       logger.error('[getSharedLink] Error getting shared link', {
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -342,7 +482,12 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
   /**
    * Update a shared link with new messages
    */
-  async function updateSharedLink(user: string, shareId: string): Promise<t.UpdateShareResult> {
+  async function updateSharedLink(
+    user: string,
+    shareId: string,
+    targetMessageId?: string,
+    expiredAt?: Date | null,
+  ): Promise<t.UpdateShareResult> {
     if (!user || !shareId) {
       throw new ShareServiceError('Missing required parameters', 'INVALID_PARAMS');
     }
@@ -363,10 +508,17 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
         .lean();
 
       const newShareId = nanoid();
+      const hasNewExpiration = expiredAt instanceof Date;
+      const resolvedTargetMessageId = targetMessageId ?? share.targetMessageId;
       const update = {
-        messages: updatedMessages,
-        user,
-        shareId: newShareId,
+        $set: {
+          messages: updatedMessages,
+          user,
+          shareId: newShareId,
+          ...(resolvedTargetMessageId && { targetMessageId: resolvedTargetMessageId }),
+          ...(hasNewExpiration && { expiredAt }),
+        },
+        ...(expiredAt === null ? { $unset: { expiredAt: 1 } } : {}),
       };
 
       const updatedShare = (await SharedLink.findOneAndUpdate({ shareId, user }, update, {
@@ -381,7 +533,11 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
 
       anonymizeConvo(updatedShare);
 
-      return { shareId: newShareId, conversationId: updatedShare.conversationId };
+      return {
+        shareId: newShareId,
+        conversationId: updatedShare.conversationId,
+        targetMessageId: updatedShare.targetMessageId,
+      };
     } catch (error) {
       logger.error('[updateSharedLink] Error updating shared link', {
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -438,6 +594,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')) {
     deleteSharedLink,
     getSharedMessages,
     deleteAllSharedLinks,
+    deleteConvoSharedLink,
   };
 }
 

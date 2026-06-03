@@ -1,11 +1,14 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
+import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
 import { CSSTransition } from 'react-transition-group';
 import type { TMessage } from 'librechat-data-provider';
 import { useScreenshot, useMessageScrolling, useLocalize } from '~/hooks';
 import ScrollToBottom from '~/components/Messages/ScrollToBottom';
 import { MessagesViewProvider } from '~/Providers';
+import { fontSizeAtom } from '~/store/fontSize';
 import MultiMessage from './MultiMessage';
+import MessageNav from './MessageNav';
 import { cn } from '~/utils';
 import store from '~/store';
 
@@ -15,10 +18,11 @@ function MessagesViewContent({
   messagesTree?: TMessage[] | null;
 }) {
   const localize = useLocalize();
-  const fontSize = useRecoilValue(store.fontSize);
+  const fontSize = useAtomValue(fontSizeAtom);
   const { screenshotTargetRef } = useScreenshot();
   const scrollButtonPreference = useRecoilValue(store.showScrollButton);
   const [currentEditId, setCurrentEditId] = useState<number | string | null>(-1);
+  const scrollToBottomRef = useRef<HTMLDivElement>(null);
 
   const {
     conversation,
@@ -45,7 +49,7 @@ function MessagesViewContent({
               width: '100%',
             }}
           >
-            <div className="flex flex-col pb-9 dark:bg-transparent">
+            <div className="flex flex-col pb-9 pt-14 dark:bg-transparent">
               {(_messagesTree && _messagesTree.length == 0) || _messagesTree === null ? (
                 <div
                   className={cn(
@@ -59,7 +63,6 @@ function MessagesViewContent({
                 <>
                   <div ref={screenshotTargetRef}>
                     <MultiMessage
-                      key={conversationId}
                       messagesTree={_messagesTree}
                       messageId={conversationId ?? null}
                       setCurrentEditId={setCurrentEditId}
@@ -79,15 +82,18 @@ function MessagesViewContent({
           <CSSTransition
             in={showScrollButton && scrollButtonPreference}
             timeout={{
-              enter: 550,
-              exit: 700,
+              enter: 300,
+              exit: 250,
             }}
             classNames="scroll-animation"
             unmountOnExit={true}
             appear={true}
+            nodeRef={scrollToBottomRef}
           >
-            <ScrollToBottom scrollHandler={handleSmoothToRef} />
+            <ScrollToBottom ref={scrollToBottomRef} scrollHandler={handleSmoothToRef} />
           </CSSTransition>
+
+          <MessageNav scrollableRef={scrollableRef} />
         </div>
       </div>
     </>

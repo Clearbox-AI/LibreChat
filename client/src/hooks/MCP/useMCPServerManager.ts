@@ -1,35 +1,98 @@
 import { useCallback, useState, useMemo, useRef, useEffect } from 'react';
+import { useAtom } from 'jotai';
 import { useToastContext } from '@librechat/client';
 import { useQueryClient } from '@tanstack/react-query';
-import { Constants, QueryKeys } from 'librechat-data-provider';
+import {
+  Constants,
+  QueryKeys,
+  MCPOptions,
+  Permissions,
+  ResourceType,
+  PermissionTypes,
+} from 'librechat-data-provider';
 import {
   useCancelMCPOAuthMutation,
   useUpdateUserPluginsMutation,
   useReinitializeMCPServerMutation,
+  useGetAllEffectivePermissionsQuery,
 } from 'librechat-data-provider/react-query';
 import type { TUpdateUserPlugins, TPlugin, MCPServersResponse } from 'librechat-data-provider';
+import type { MCPServerInitState } from '~/store/mcp';
 import type { ConfigFieldDetail } from '~/common';
-import { useLocalize, useMCPSelect, useMCPConnectionStatus } from '~/hooks';
-import { useGetStartupConfig } from '~/data-provider';
+import { useLocalize, useHasAccess, useMCPSelect, useMCPConnectionStatus } from '~/hooks';
+import { useGetStartupConfig, useMCPServersQuery } from '~/data-provider';
+import { mcpServerInitStatesAtom, getServerInitState } from '~/store/mcp';
 
-interface ServerState {
-  isInitializing: boolean;
-  oauthUrl: string | null;
-  oauthStartTime: number | null;
-  isCancellable: boolean;
-  pollInterval: NodeJS.Timeout | null;
+export interface MCPServerDefinition {
+  serverName: string;
+  config: MCPOptions;
+  dbId?: string; // MongoDB ObjectId for database servers (used for permissions)
+  effectivePermissions: number; // Permission bits (VIEW=1, EDIT=2, DELETE=4, SHARE=8)
+  consumeOnly?: boolean;
 }
 
-export function useMCPServerManager({ conversationId }: { conversationId?: string | null } = {}) {
+// Poll intervals are kept local since they're timer references that can't be serialized
+// The init states (isInitializing, isCancellable, etc.) are stored in the global Jotai atom
+type PollIntervals = Record<string, NodeJS.Timeout | null>;
+
+export function useMCPServerManager({
+  conversationId,
+  storageContextKey,
+}: { conversationId?: string | null; storageContextKey?: string } = {}) {
   const localize = useLocalize();
   const queryClient = useQueryClient();
   const { showToast } = useToastContext();
+  /** Retained for `interface.mcpServers.placeholder` used by `placeholderText` below */
   const { data: startupConfig } = useGetStartupConfig();
-  const { mcpValues, setMCPValues, isPinned, setIsPinned } = useMCPSelect({ conversationId });
+  const canUseMcp = useHasAccess({
+    permissionType: PermissionTypes.MCP_SERVERS,
+    permission: Permissions.USE,
+  });
+
+  const { data: loadedServers, isLoading } = useMCPServersQuery({ enabled: canUseMcp });
+
+  // Fetch effective permissions for all MCP servers
+  const { data: permissionsMap } = useGetAllEffectivePermissionsQuery(ResourceType.MCPSERVER, {
+    enabled: canUseMcp,
+  });
 
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [selectedToolForConfig, setSelectedToolForConfig] = useState<TPlugin | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  const availableMCPServers: MCPServerDefinition[] = useMemo<MCPServerDefinition[]>(() => {
+    const definitions: MCPServerDefinition[] = [];
+    if (loadedServers) {
+      for (const [serverName, metadata] of Object.entries(loadedServers)) {
+        const { dbId, consumeOnly, ...config } = metadata;
+
+        // Get effective permissions from the permissions map using _id
+        // Fall back to 1 (VIEW) for YAML-based servers without _id
+        const effectivePermissions = dbId && permissionsMap?.[dbId] ? permissionsMap[dbId] : 1;
+
+        definitions.push({
+          serverName,
+          dbId,
+          effectivePermissions,
+          consumeOnly,
+          config,
+        });
+      }
+    }
+    return definitions;
+  }, [loadedServers, permissionsMap]);
+
+  // Memoize filtered servers for useMCPSelect to prevent infinite loops
+  const selectableServers = useMemo(
+    () => availableMCPServers.filter((s) => s.config.chatMenu !== false && !s.consumeOnly),
+    [availableMCPServers],
+  );
+
+  const { mcpValues, setMCPValues, isPinned, setIsPinned } = useMCPSelect({
+    conversationId,
+    storageContextKey,
+    servers: selectableServers,
+  });
   const mcpValuesRef = useRef(mcpValues);
 
   // fixes the issue where OAuth flows would deselect all the servers except the one that is being authenticated on success
@@ -37,21 +100,35 @@ export function useMCPServerManager({ conversationId }: { conversationId?: strin
     mcpValuesRef.current = mcpValues;
   }, [mcpValues]);
 
-  const configuredServers = useMemo(() => {
-    if (!startupConfig?.mcpServers) return [];
-    return Object.entries(startupConfig.mcpServers)
-      .filter(([, config]) => config.chatMenu !== false)
-      .map(([serverName]) => serverName);
-  }, [startupConfig?.mcpServers]);
+  // Check if specific permission bit is set
+  const checkEffectivePermission = useCallback(
+    (effectivePermissions: number, permissionBit: number): boolean => {
+      return (effectivePermissions & permissionBit) !== 0;
+    },
+    [],
+  );
 
   const reinitializeMutation = useReinitializeMCPServerMutation();
   const cancelOAuthMutation = useCancelMCPOAuthMutation();
 
   const updateUserPluginsMutation = useUpdateUserPluginsMutation({
-    onSuccess: async () => {
-      showToast({ message: localize('com_nav_mcp_vars_updated'), status: 'success' });
+    onSuccess: async (_data, variables) => {
+      const isRevoke = variables.action === 'uninstall';
+      const message = isRevoke
+        ? localize('com_nav_mcp_access_revoked')
+        : localize('com_nav_mcp_vars_updated');
+      showToast({ message, status: 'success' });
+
+      /** Deselect server from mcpValues when revoking access */
+      if (isRevoke && variables.pluginKey?.startsWith(Constants.mcp_prefix)) {
+        const serverName = variables.pluginKey.replace(Constants.mcp_prefix, '');
+        const currentValues = mcpValuesRef.current ?? [];
+        const filteredValues = currentValues.filter((name) => name !== serverName);
+        setMCPValues(filteredValues);
+      }
 
       await Promise.all([
+        queryClient.invalidateQueries([QueryKeys.mcpServers]),
         queryClient.invalidateQueries([QueryKeys.mcpTools]),
         queryClient.invalidateQueries([QueryKeys.mcpAuthValues]),
         queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]),
@@ -66,143 +143,83 @@ export function useMCPServerManager({ conversationId }: { conversationId?: strin
     },
   });
 
-  const [serverStates, setServerStates] = useState<Record<string, ServerState>>(() => {
-    const initialStates: Record<string, ServerState> = {};
-    configuredServers.forEach((serverName) => {
-      initialStates[serverName] = {
-        isInitializing: false,
-        oauthUrl: null,
-        oauthStartTime: null,
-        isCancellable: false,
-        pollInterval: null,
-      };
-    });
-    return initialStates;
-  });
+  // Global atom for init states - shared across all useMCPServerManager instances
+  // This enables canceling OAuth from both chat dropdown and settings panel
+  const [serverInitStates, setServerInitStates] = useAtom(mcpServerInitStatesAtom);
+
+  // Poll intervals are kept local (not serializable)
+  const pollIntervalsRef = useRef<PollIntervals>({});
 
   const { connectionStatus } = useMCPConnectionStatus({
-    enabled: !!startupConfig?.mcpServers && Object.keys(startupConfig.mcpServers).length > 0,
+    enabled: !isLoading && availableMCPServers.length > 0,
   });
 
-  /** Filter disconnected servers when values change, but only after initial load
-   This prevents clearing selections on page refresh when servers haven't connected yet
-   */
-  const hasInitialLoadCompleted = useRef(false);
-
+  /** Apply admin-configured default MCP servers when the user has no current selection */
   useEffect(() => {
-    if (!connectionStatus || Object.keys(connectionStatus).length === 0) {
+    const defaultEnabledTools = startupConfig?.interface?.defaultEnabledMcpTools;
+    if (!defaultEnabledTools?.length || !connectionStatus) {
       return;
     }
 
-    if (!hasInitialLoadCompleted.current) {
-      hasInitialLoadCompleted.current = true;
-      return;
-    }
-
-    if (!mcpValues?.length) return;
-
-    const connectedSelected = mcpValues.filter(
-      (serverName) => connectionStatus[serverName]?.connectionState === 'connected',
-    );
-
-    if (connectedSelected.length !== mcpValues.length) {
-      setMCPValues(connectedSelected);
-    }
-  }, [connectionStatus, mcpValues, setMCPValues]);
-
-useEffect(() => {
-    // if no default tools are configured, skip this effect
-    if (!startupConfig?.interface || !configuredServers || !connectionStatus) {
-      console.log('MCP Manager: Waiting for data to load', {
-        hasStartupConfig: !!startupConfig?.interface,
-        configuredServersCount: configuredServers?.length || 0,
-        connectionStatusCount: Object.keys(connectionStatus || {}).length
-      });
-      return;
-    }
-
-    const defaultEnabledTools = startupConfig.interface.defaultEnabledMcpTools;
-    console.log('MCP Manager: Read defaultEnabledMcpTools from config:', defaultEnabledTools);
-    if (!defaultEnabledTools || defaultEnabledTools.length === 0) {
-      console.log('MCP Manager: No default enabled tools configured');
-      return;
-    }
-
-    // if no tools are selected, apply default enabled tools
+    /** Only seed defaults when the user has loaded but not selected any servers */
     if (!mcpValues || mcpValues.length > 0) {
-      console.log('MCP Manager: Skipping - user has selected tools or no mcpValues', { mcpValues });
       return;
     }
 
-    console.log('MCP Manager: Applying default enabled tools', {
-      defaultEnabledTools,
-      configuredServers,
-      connectionStatusKeys: Object.keys(connectionStatus)
-    });
-
-    // filter default tools to only those that are configured and connected
-    const connectedDefaultTools = defaultEnabledTools.filter(
-      (serverName) => {
-        const isConfigured = configuredServers.includes(serverName);
-        const isConnected = connectionStatus[serverName]?.connectionState === 'connected';
-        console.log(`MCP Manager: Checking server ${serverName} - configured: ${isConfigured}, connected: ${isConnected}`);
-        return isConfigured && isConnected;
-      }
+    const selectableNames = new Set(selectableServers.map((server) => server.serverName));
+    const connectedDefaults = defaultEnabledTools.filter(
+      (serverName) =>
+        selectableNames.has(serverName) &&
+        connectionStatus[serverName]?.connectionState === 'connected',
     );
 
-    console.log('MCP Manager: Connected default tools', connectedDefaultTools);
-
-    if (connectedDefaultTools.length > 0) {
-      console.log('MCP Manager: Setting default MCP tools', connectedDefaultTools);
-      setMCPValues(connectedDefaultTools);
+    if (connectedDefaults.length > 0) {
+      setMCPValues(connectedDefaults);
     }
   }, [
     startupConfig?.interface?.defaultEnabledMcpTools,
-    configuredServers,
+    selectableServers,
     connectionStatus,
     mcpValues,
     setMCPValues,
-    startupConfig?.interface
   ]);
 
-
-  const updateServerState = useCallback((serverName: string, updates: Partial<ServerState>) => {
-    setServerStates((prev) => {
-      const newStates = { ...prev };
-      const currentState = newStates[serverName] || {
-        isInitializing: false,
-        oauthUrl: null,
-        oauthStartTime: null,
-        isCancellable: false,
-        pollInterval: null,
-      };
-      newStates[serverName] = { ...currentState, ...updates };
-      return newStates;
-    });
-  }, []);
+  const updateServerInitState = useCallback(
+    (serverName: string, updates: Partial<MCPServerInitState>) => {
+      setServerInitStates((prev) => {
+        const currentState = getServerInitState(prev, serverName);
+        return {
+          ...prev,
+          [serverName]: { ...currentState, ...updates },
+        };
+      });
+    },
+    [setServerInitStates],
+  );
 
   const cleanupServerState = useCallback(
     (serverName: string) => {
-      const state = serverStates[serverName];
-      if (state?.pollInterval) {
-        clearTimeout(state.pollInterval);
+      // Clear local poll interval
+      const pollInterval = pollIntervalsRef.current[serverName];
+      if (pollInterval) {
+        clearTimeout(pollInterval);
+        pollIntervalsRef.current[serverName] = null;
       }
-      updateServerState(serverName, {
+      // Reset global init state
+      updateServerInitState(serverName, {
         isInitializing: false,
         oauthUrl: null,
         oauthStartTime: null,
         isCancellable: false,
-        pollInterval: null,
       });
     },
-    [serverStates, updateServerState],
+    [updateServerInitState],
   );
 
   const startServerPolling = useCallback(
     (serverName: string) => {
       // Prevent duplicate polling for the same server
-      const existingState = serverStates[serverName];
-      if (existingState?.pollInterval) {
+      if (pollIntervalsRef.current[serverName]) {
         console.debug(`[MCP Manager] Polling already active for ${serverName}, skipping duplicate`);
         return;
       }
@@ -225,7 +242,7 @@ useEffect(() => {
       const pollOnce = async () => {
         try {
           pollAttempts++;
-          const state = serverStates[serverName];
+          const state = getServerInitState(serverInitStates, serverName);
 
           /** Stop polling after 3 minutes or max attempts */
           const elapsedTime = state?.oauthStartTime
@@ -317,7 +334,7 @@ useEffect(() => {
           }
 
           timeoutId = setTimeout(pollOnce, nextInterval);
-          updateServerState(serverName, { pollInterval: timeoutId });
+          pollIntervalsRef.current[serverName] = timeoutId;
         } catch (error) {
           console.error(`[MCP Manager] Error polling server ${serverName}:`, error);
           if (timeoutId) {
@@ -330,22 +347,14 @@ useEffect(() => {
 
       // Start the first poll
       timeoutId = setTimeout(pollOnce, getPollInterval(0));
-      updateServerState(serverName, { pollInterval: timeoutId });
+      pollIntervalsRef.current[serverName] = timeoutId;
     },
-    [
-      queryClient,
-      serverStates,
-      showToast,
-      localize,
-      setMCPValues,
-      cleanupServerState,
-      updateServerState,
-    ],
+    [queryClient, serverInitStates, showToast, localize, setMCPValues, cleanupServerState],
   );
 
   const initializeServer = useCallback(
     async (serverName: string, autoOpenOAuth: boolean = true) => {
-      updateServerState(serverName, { isInitializing: true });
+      updateServerInitState(serverName, { isInitializing: true });
       try {
         const response = await reinitializeMutation.mutateAsync(serverName);
         if (!response.success) {
@@ -358,7 +367,7 @@ useEffect(() => {
         }
 
         if (response.oauthRequired && response.oauthUrl) {
-          updateServerState(serverName, {
+          updateServerInitState(serverName, {
             oauthUrl: response.oauthUrl,
             oauthStartTime: Date.now(),
             isCancellable: true,
@@ -371,7 +380,12 @@ useEffect(() => {
 
           startServerPolling(serverName);
         } else {
-          await queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]);
+          await Promise.all([
+            queryClient.invalidateQueries([QueryKeys.mcpServers]),
+            queryClient.invalidateQueries([QueryKeys.mcpTools]),
+            queryClient.invalidateQueries([QueryKeys.mcpAuthValues]),
+            queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]),
+          ]);
 
           showToast({
             message: localize('com_ui_mcp_initialized_success', { 0: serverName }),
@@ -396,7 +410,7 @@ useEffect(() => {
       }
     },
     [
-      updateServerState,
+      updateServerInitState,
       reinitializeMutation,
       startServerPolling,
       queryClient,
@@ -413,7 +427,12 @@ useEffect(() => {
       cancelOAuthMutation.mutate(serverName, {
         onSuccess: () => {
           cleanupServerState(serverName);
-          queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]);
+          Promise.all([
+            queryClient.invalidateQueries([QueryKeys.mcpServers]),
+            queryClient.invalidateQueries([QueryKeys.mcpTools]),
+            queryClient.invalidateQueries([QueryKeys.mcpAuthValues]),
+            queryClient.invalidateQueries([QueryKeys.mcpConnectionStatus]),
+          ]);
 
           showToast({
             message: localize('com_ui_mcp_oauth_cancelled', { 0: serverName }),
@@ -434,55 +453,28 @@ useEffect(() => {
 
   const isInitializing = useCallback(
     (serverName: string) => {
-      return serverStates[serverName]?.isInitializing || false;
+      return getServerInitState(serverInitStates, serverName).isInitializing;
     },
-    [serverStates],
+    [serverInitStates],
   );
 
   const isCancellable = useCallback(
     (serverName: string) => {
-      return serverStates[serverName]?.isCancellable || false;
+      return getServerInitState(serverInitStates, serverName).isCancellable;
     },
-    [serverStates],
+    [serverInitStates],
   );
 
   const getOAuthUrl = useCallback(
     (serverName: string) => {
-      return serverStates[serverName]?.oauthUrl || null;
+      return getServerInitState(serverInitStates, serverName).oauthUrl;
     },
-    [serverStates],
+    [serverInitStates],
   );
 
   const placeholderText = useMemo(
     () => startupConfig?.interface?.mcpServers?.placeholder || localize('com_ui_mcp_servers'),
     [startupConfig?.interface?.mcpServers?.placeholder, localize],
-  );
-
-  const batchToggleServers = useCallback(
-    (serverNames: string[]) => {
-      const connectedServers: string[] = [];
-      const disconnectedServers: string[] = [];
-
-      serverNames.forEach((serverName) => {
-        if (isInitializing(serverName)) {
-          return;
-        }
-
-        const serverStatus = connectionStatus?.[serverName];
-        if (serverStatus?.connectionState === 'connected') {
-          connectedServers.push(serverName);
-        } else {
-          disconnectedServers.push(serverName);
-        }
-      });
-
-      setMCPValues(connectedServers);
-
-      disconnectedServers.forEach((serverName) => {
-        initializeServer(serverName);
-      });
-    },
-    [connectionStatus, setMCPValues, initializeServer, isInitializing],
   );
 
   const toggleServerSelection = useCallback(
@@ -498,15 +490,10 @@ useEffect(() => {
         const filteredValues = currentValues.filter((name) => name !== serverName);
         setMCPValues(filteredValues);
       } else {
-        const serverStatus = connectionStatus?.[serverName];
-        if (serverStatus?.connectionState === 'connected') {
-          setMCPValues([...currentValues, serverName]);
-        } else {
-          initializeServer(serverName);
-        }
+        setMCPValues([...currentValues, serverName]);
       }
     },
-    [mcpValues, setMCPValues, connectionStatus, initializeServer, isInitializing],
+    [mcpValues, setMCPValues, isInitializing],
   );
 
   const handleConfigSave = useCallback(
@@ -532,13 +519,23 @@ useEffect(() => {
           auth: {},
         };
         updateUserPluginsMutation.mutate(payload);
-
-        const currentValues = mcpValues ?? [];
-        const filteredValues = currentValues.filter((name) => name !== targetName);
-        setMCPValues(filteredValues);
+        /** Deselection is now handled centrally in updateUserPluginsMutation.onSuccess */
       }
     },
-    [selectedToolForConfig, updateUserPluginsMutation, mcpValues, setMCPValues],
+    [selectedToolForConfig, updateUserPluginsMutation],
+  );
+
+  /** Standalone revoke function for OAuth servers - doesn't require selectedToolForConfig */
+  const revokeOAuthForServer = useCallback(
+    (serverName: string) => {
+      const payload: TUpdateUserPlugins = {
+        pluginKey: `${Constants.mcp_prefix}${serverName}`,
+        action: 'uninstall',
+        auth: {},
+      };
+      updateUserPluginsMutation.mutate(payload);
+    },
+    [updateUserPluginsMutation],
   );
 
   const handleSave = useCallback(
@@ -576,7 +573,7 @@ useEffect(() => {
       ]);
       const serverData = mcpData?.servers?.[serverName];
       const serverStatus = connectionStatus?.[serverName];
-      const serverConfig = startupConfig?.mcpServers?.[serverName];
+      const serverConfig = loadedServers?.[serverName];
 
       const handleConfigClick = (e: React.MouseEvent) => {
         e.stopPropagation();
@@ -630,14 +627,7 @@ useEffect(() => {
         hasCustomUserVars,
       };
     },
-    [
-      queryClient,
-      isCancellable,
-      isInitializing,
-      cancelOAuthFlow,
-      connectionStatus,
-      startupConfig?.mcpServers,
-    ],
+    [queryClient, isCancellable, isInitializing, cancelOAuthFlow, connectionStatus, loadedServers],
   );
 
   const getConfigDialogProps = useCallback(() => {
@@ -682,7 +672,12 @@ useEffect(() => {
   ]);
 
   return {
-    configuredServers,
+    availableMCPServers,
+    /** MCP servers filtered for chat menu selection (chatMenu !== false && !consumeOnly) */
+    selectableServers,
+    availableMCPServersMap: loadedServers,
+    isLoading,
+    connectionStatus,
     initializeServer,
     cancelOAuthFlow,
     isInitializing,
@@ -694,7 +689,6 @@ useEffect(() => {
     isPinned,
     setIsPinned,
     placeholderText,
-    batchToggleServers,
     toggleServerSelection,
     localize,
 
@@ -704,7 +698,9 @@ useEffect(() => {
     setSelectedToolForConfig,
     handleSave,
     handleRevoke,
+    revokeOAuthForServer,
     getServerStatusIconProps,
     getConfigDialogProps,
+    checkEffectivePermission,
   };
 }

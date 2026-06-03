@@ -18,6 +18,7 @@ const plugins = [
   peerDepsExternal(),
   resolve({
     preferBuiltins: true,
+    skipSelf: true,
   }),
   replace({
     __IS_DEV__: isDevelopment,
@@ -44,7 +45,10 @@ const plugins = [
 ];
 
 const cjsBuild = {
-  input: 'src/index.ts',
+  input: {
+    index: 'src/index.ts',
+    telemetry: 'src/telemetry/index.ts',
+  },
   output: {
     dir: 'dist',
     format: 'cjs',

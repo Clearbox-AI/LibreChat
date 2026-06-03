@@ -3,9 +3,35 @@ import FormData from 'form-data';
 import { createReadStream } from 'fs';
 import { logger } from '@librechat/data-schemas';
 import { FileSources } from 'librechat-data-provider';
-import type { Request as ServerRequest } from 'express';
+import type { ServerRequest } from '~/types';
 import { logAxiosError, readFileAsString } from '~/utils';
 import { generateShortLivedToken } from '~/crypto/jwt';
+
+const MARKDOWN_MIME_TYPES = new Set([
+  'text/markdown',
+  'text/x-markdown',
+  'text/md',
+  'application/markdown',
+  'application/x-markdown',
+]);
+
+const MARKDOWN_EXTENSIONS_RE = /\.(md|markdown|mdown|mkdn|mkd|mdwn)$/i;
+
+function normalizeMimeType(mimetype: string): string {
+  if (!mimetype) {
+    return '';
+  }
+  const semi = mimetype.indexOf(';');
+  const base = semi === -1 ? mimetype : mimetype.slice(0, semi);
+  return base.trim().toLowerCase();
+}
+
+function isMarkdownFile(file: Express.Multer.File): boolean {
+  if (MARKDOWN_MIME_TYPES.has(normalizeMimeType(file.mimetype))) {
+    return true;
+  }
+  return MARKDOWN_EXTENSIONS_RE.test(file.originalname ?? '');
+}
 
 /**
  * Attempts to parse text using RAG API, falls back to native text parsing
@@ -20,14 +46,19 @@ export async function parseText({
   file,
   file_id,
 }: {
-  req: Pick<ServerRequest, 'user'> & {
-    user?: { id: string };
-  };
+  req: ServerRequest;
   file: Express.Multer.File;
   file_id: string;
 }): Promise<{ text: string; bytes: number; source: string }> {
   if (!process.env.RAG_API_URL) {
     logger.debug('[parseText] RAG_API_URL not defined, falling back to native text parsing');
+    return parseTextNative(file);
+  }
+
+  if (isMarkdownFile(file)) {
+    logger.debug(
+      `[parseText] Markdown file detected (${file.originalname}, ${file.mimetype}), using native parsing to preserve raw formatting`,
+    );
     return parseTextNative(file);
   }
 
@@ -67,7 +98,7 @@ export async function parseText({
         accept: 'application/json',
         ...formHeaders,
       },
-      timeout: 30000,
+      timeout: 300000,
     });
 
     const responseData = response.data;

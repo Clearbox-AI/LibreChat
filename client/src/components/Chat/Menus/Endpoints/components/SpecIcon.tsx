@@ -1,7 +1,8 @@
 import React, { memo } from 'react';
+import { getEndpointField } from 'librechat-data-provider';
 import type { TModelSpec, TEndpointsConfig } from 'librechat-data-provider';
 import type { IconMapProps } from '~/common';
-import { getModelSpecIconURL, getIconKey, getEndpointField } from '~/utils';
+import { getModelSpecIconURL, getIconKey } from '~/utils';
 import { URLIcon } from '~/components/Endpoints/URLIcon';
 import { icons } from '~/hooks/Endpoint/Icons';
 
@@ -14,7 +15,7 @@ type IconType = (props: IconMapProps) => React.JSX.Element;
 
 const SpecIcon: React.FC<SpecIconProps> = ({ currentSpec, endpointsConfig }) => {
   const iconURL = getModelSpecIconURL(currentSpec);
-  const { endpoint } = currentSpec.preset;
+  const endpoint = currentSpec.preset?.endpoint;
   const endpointIconURL = getEndpointField(endpointsConfig, endpoint, 'iconURL');
   const iconKey = getIconKey({ endpoint, endpointsConfig, endpointIconURL });
   let Icon: IconType;
