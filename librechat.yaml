@@ -13,6 +13,12 @@ mcpServers:
     url: http://172.18.0.1:8080/sse
     serverInstructions: true
 
+# Exempt the Docker-host private IP from MCP SSRF protection so LibreChat can
+# reach the local "replica" server. Scoped to a single host:port pair.
+mcpSettings:
+  allowedAddresses:
+    - "172.18.0.1:8080"
+
 endpoints:
   agents:
     recursionLimit: 50
@@ -32,6 +38,8 @@ endpoints:
       - "chain"
       - "web_search"
       - "context"
+      - "artifacts"
+      - "skills"
 
 
 registration:
@@ -61,10 +69,13 @@ interface:
   prompts: false
   bookmarks: false
   multiConvo: false
-  agents: false
+  agents: true
+  artifacts: true
 #  customWelcome: "Hey {{user.name}}! Welcome to LibreChat"
   runCode: false
-  webSearch: false
+  webSearch: true
+  memories: false
+  skills: true
   fileSearch: false
   fileCitations: false
   defaultEnabledMcpTools:
