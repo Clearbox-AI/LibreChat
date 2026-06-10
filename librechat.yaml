@@ -75,7 +75,8 @@ interface:
   runCode: false
   webSearch: true
   memories: false
-  skills: true
+  skills:
+    defaultActiveOnShare: true
   fileSearch: false
   fileCitations: false
   defaultEnabledMcpTools:
@@ -87,6 +88,4 @@ fileConfig:
   endpoints:
     anthropic:
       disabled: true
-
-
 
