@@ -6,9 +6,15 @@ const {
   createSafeUser,
   mcpToolPattern,
   loadWebSearchAuth,
+  splitMCPToolKey,
+  buildInlineMemoryTool,
   getCodeApiAuthHeaders,
   buildImageToolContext,
+  SET_MEMORY_TOOL_NAME,
   buildWebSearchContext,
+  DELETE_MEMORY_TOOL_NAME,
+  createAskUserQuestionTool,
+  ASK_USER_QUESTION_TOOL_NAME,
   buildWebSearchDynamicContext,
 } = require('@librechat/api');
 const {
@@ -17,6 +23,7 @@ const {
   Permissions,
   EToolResources,
   PermissionTypes,
+  AgentCapabilities,
 } = require('librechat-data-provider');
 const {
   availableTools,
@@ -35,14 +42,20 @@ const {
   createGeminiImageTool,
   createOpenAIImageTools,
 } = require('../');
-const { createMCPTool, createMCPTools, resolveConfigServers } = require('~/server/services/MCP');
+const {
+  createMCPTool,
+  createMCPTools,
+  createMCPPermissionContext,
+  resolveMcpServerContext,
+} = require('~/server/services/MCP');
+const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 const { createFileSearchTool, primeFiles: primeSearchFiles } = require('./fileSearch');
 const { primeFiles: primeCodeFiles } = require('~/server/services/Files/Code/process');
 const { getUserPluginAuthValue } = require('~/server/services/PluginService');
 const { loadAuthValues } = require('~/server/services/Tools/credentials');
-const { getMCPServerTools } = require('~/server/services/Config');
+const { getMCPServerTools, checkCapability } = require('~/server/services/Config');
 const { getMCPServersRegistry } = require('~/config');
-const { getRoleByName } = require('~/models');
+const { getRoleByName, setMemory, deleteMemory, getFormattedMemories } = require('~/models');
 
 /**
  * Validates the availability and authentication of tools for a user based on environment variables or user-specific plugin authentication values.
@@ -227,6 +240,13 @@ const loadTools = async ({
   };
 
   const requestedTools = {};
+  const hasMCPTools = tools.some((toolName) => toolName && mcpToolPattern.test(toolName));
+  const mcpPermissionContext =
+    options.mcpPermissionContext ?? createMCPPermissionContext(options.req);
+  const canUseMCP = hasMCPTools
+    ? await mcpPermissionContext.canUseServers(options.req?.user)
+    : true;
+  let loggedMCPDenied = false;
 
   if (functions === true) {
     toolConstructors.dalle = DALLE3;
@@ -266,8 +286,13 @@ const loadTools = async ({
 
   /** Resolve config-source servers for the current user/tenant context */
   let configServers;
-  if (tools.some((tool) => tool && mcpToolPattern.test(tool))) {
-    configServers = await resolveConfigServers(options.req);
+  /** All configured names, in the normalized form tool keys carry */
+  let mcpServerNames = [];
+  if (hasMCPTools && canUseMCP) {
+    /** Reuse the caller's context when it already resolved one, so the chat
+     *  startup path reads the request app config once. */
+    ({ configServers, serverNames: mcpServerNames } =
+      options.mcpServerContext ?? (await resolveMcpServerContext(options.req)));
   }
 
   for (const tool of tools) {
@@ -283,10 +308,18 @@ const loadTools = async ({
         if (files?.length) {
           primedCodeFiles = files;
         }
+        /* Hedge the execute_code description toward persistence only when the
+         * admin `stateful_code_sessions` capability is on AND the agent opted
+         * in via the builder (off by default); the matching wire hint is set
+         * in the run config. Older @librechat/agents ignore the param. */
+        const statefulSessions =
+          agent?.stateful_code_sessions === true &&
+          (await checkCapability(options.req, AgentCapabilities.stateful_code_sessions));
         return createCodeExecutionTool({
           user_id: user,
           files,
           authHeaders: () => getCodeApiAuthHeaders(options.req),
+          statefulSessions,
         });
       };
       continue;
@@ -344,8 +377,32 @@ const loadTools = async ({
         });
       };
       continue;
+    } else if (tool === ASK_USER_QUESTION_TOOL_NAME) {
+      requestedTools[tool] = async () => createAskUserQuestionTool();
+      continue;
+    } else if (tool === SET_MEMORY_TOOL_NAME || tool === DELETE_MEMORY_TOOL_NAME) {
+      requestedTools[tool] = () =>
+        buildInlineMemoryTool({
+          toolName: tool,
+          req: options.req,
+          agent,
+          userId: user,
+          memoryMethods: { setMemory, deleteMemory, getFormattedMemories },
+          getRoleByName,
+        });
+      continue;
     } else if (tool && mcpToolPattern.test(tool)) {
-      const [toolName, serverName] = tool.split(Constants.mcp_delimiter);
+      if (!canUseMCP) {
+        if (!loggedMCPDenied) {
+          logger.warn(
+            `[handleTools] User ${options.req?.user?.id} lacks MCP server use permission`,
+          );
+          loggedMCPDenied = true;
+        }
+        continue;
+      }
+
+      const [toolName, serverName] = splitMCPToolKey(tool, mcpServerNames);
       if (toolName === Constants.mcp_server) {
         /** Placeholder used for UI purposes */
         continue;
@@ -429,24 +486,30 @@ const loadTools = async ({
   let index = -1;
   const failedMCPServers = new Set();
   const safeUser = createSafeUser(options.req?.user);
+  const requestScopedConnections =
+    options.requestScopedConnections ?? getMCPRequestContext(options.req, options.res);
 
   for (const [serverName, toolConfigs] of Object.entries(requestedMCPTools)) {
     index++;
     /** @type {LCAvailableTools} */
-    let availableTools;
+    let availableTools = options.mcpAvailableTools?.[serverName];
     for (const config of toolConfigs) {
       try {
         if (failedMCPServers.has(serverName)) {
           continue;
         }
         const mcpParams = {
+          mcpPermissionContext,
           index,
           signal,
           user: safeUser,
           userMCPAuthMap,
           configServers,
+          requestBody: options.req?.body,
+          requestScopedConnections,
           res: options.res,
           streamId: options.req?._resumableStreamId || null,
+          jobCreatedAt: options.jobCreatedAt,
           model: agent?.model ?? model,
           serverName: config.serverName,
           provider: agent?.provider ?? endpoint,
@@ -465,7 +528,7 @@ const loadTools = async ({
         }
         if (!availableTools) {
           try {
-            availableTools = await getMCPServerTools(safeUser.id, serverName);
+            availableTools = await getMCPServerTools(safeUser.id, serverName, config.config);
           } catch (error) {
             logger.error(`Error fetching available tools for MCP server ${serverName}:`, error);
           }
@@ -479,6 +542,9 @@ const loadTools = async ({
                 ...mcpParams,
                 availableTools,
                 toolKey: config.toolKey,
+                onAvailableTools: (tools) => {
+                  availableTools = tools;
+                },
               });
 
         if (Array.isArray(mcpTool)) {

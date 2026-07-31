@@ -1,30 +1,48 @@
 const { tool } = require('@librechat/agents/langchain/tools');
 const { logger, getTenantId } = require('@librechat/data-schemas');
-const {
-  Providers,
-  StepTypes,
-  GraphEvents,
-  Constants: AgentConstants,
-} = require('@librechat/agents');
+const { Providers, Constants: AgentConstants } = require('@librechat/agents');
 const {
   sendEvent,
+  PENDING_STALE_MS,
   MCPOAuthHandler,
   isMCPDomainAllowed,
+  splitMCPToolKey,
   normalizeServerName,
+  resolveMCPServerContext,
   normalizeJsonSchema,
   GenerationJobManager,
   resolveJsonSchemaRefs,
-  buildOAuthToolCallName,
+  sanitizeGeminiSchema,
+  buildMCPAuthStepId,
+  buildMCPAuthToolCall,
+  processMCPEnv,
+  buildMCPAuthRunStepEvent,
+  buildMCPAuthRunStepDeltaEvent,
+  buildMCPAuthRunStepEndDeltaEvent,
+  isUserSourced,
+  checkAccessWithRequestCache,
+  requiresEphemeralUserConnection,
+  containsGraphTokenPlaceholder,
 } = require('@librechat/api');
-const { Time, CacheKeys, Constants, isAssistantsEndpoint } = require('librechat-data-provider');
+const {
+  Time,
+  CacheKeys,
+  Constants,
+  Permissions,
+  PermissionTypes,
+  isAssistantsEndpoint,
+} = require('librechat-data-provider');
 const {
   getOAuthReconnectionManager,
   getMCPServersRegistry,
   getFlowStateManager,
   getMCPManager,
 } = require('~/config');
-const { findToken, createToken, updateToken, deleteTokens } = require('~/models');
+const db = require('~/models');
+const { findToken, createToken, updateToken, deleteTokens } = db;
 const { getGraphApiToken } = require('./GraphTokenService');
+const { exchangeOboToken } = require('./OboTokenService');
+const { createOboTrustChecker } = require('./OboPolicyService');
 const { reinitMCPServer } = require('./Tools/mcp');
 const { getAppConfig } = require('./Config');
 const { getLogStores } = require('~/cache');
@@ -35,6 +53,31 @@ const RECONNECT_THROTTLE_MS = 10_000;
 
 const missingToolCache = new Map();
 const MISSING_TOOL_TTL_MS = 10_000;
+
+async function userCanUseMCPServers(user, req) {
+  if (!user?.id || !user?.role) {
+    return false;
+  }
+
+  try {
+    return await checkAccessWithRequestCache({
+      req,
+      user,
+      permissionType: PermissionTypes.MCP_SERVERS,
+      permissions: [Permissions.USE],
+      getRoleByName: db.getRoleByName,
+    });
+  } catch (error) {
+    logger.error(`[MCP][User: ${user.id}] Failed MCP permission check`, error);
+    return false;
+  }
+}
+
+function createMCPPermissionContext(req) {
+  return {
+    canUseServers: (user = req?.user) => userCanUseMCPServers(user, req),
+  };
+}
 
 function evictStale(map, ttl) {
   if (map.size <= MAX_CACHE_SIZE) {
@@ -53,6 +96,13 @@ function evictStale(map, ttl) {
 
 const unavailableMsg =
   "This tool's MCP server is temporarily unavailable. Please try again shortly.";
+
+function getOAuthFlowId(userId, serverName, tenantId = getTenantId()) {
+  if (!tenantId) {
+    return MCPOAuthHandler.generateFlowId(userId, serverName);
+  }
+  return MCPOAuthHandler.generateFlowId(userId, serverName, tenantId);
+}
 
 async function getAppConfigForRequest(req) {
   const user = req?.user;
@@ -96,6 +146,50 @@ async function resolveMcpConfigNames(req) {
 }
 
 /**
+ * All configured server names in the normalized form tool keys are built with.
+ * Unlike `resolveConfigServers`, this keeps unmodified YAML servers, which
+ * `ensureConfigServers` skips - those are exactly the ones that must still
+ * resolve the tool-key boundary.
+ * @param {import('express').Request} req
+ * @returns {Promise<string[]>}
+ */
+async function resolveMcpServerNames(req) {
+  try {
+    const names = await resolveMcpConfigNames(req);
+    return names.map(normalizeServerName);
+  } catch (error) {
+    logger.warn(
+      '[resolveMcpServerNames] Failed to resolve server names, degrading to empty:',
+      error,
+    );
+    return [];
+  }
+}
+
+/**
+ * Config-source servers and all configured names from a single app-config read,
+ * so the tool-loading path does not pay two lookups for the same principal.
+ * Degrades to empty like `resolveConfigServers` rather than aborting tool loading.
+ * @param {import('express').Request} req
+ * @returns {Promise<{ configServers: Record<string, import('@librechat/api').ParsedServerConfig>, serverNames: string[] }>}
+ */
+async function resolveMcpServerContext(req) {
+  try {
+    const appConfig = await getAppConfigForRequest(req);
+    return await resolveMCPServerContext({
+      mcpConfig: appConfig?.mcpConfig || {},
+      ensureConfigServers: (mcpConfig) => getMCPServersRegistry().ensureConfigServers(mcpConfig),
+    });
+  } catch (error) {
+    logger.warn(
+      '[resolveMcpServerContext] Failed to resolve MCP servers, degrading to empty:',
+      error,
+    );
+    return { configServers: {}, serverNames: [] };
+  }
+}
+
+/**
  * Resolves config-source servers and merges all server configs (YAML + config + user DB)
  * for the given user context. Shared helper for controllers needing the full merged config.
  * @param {string} userId
@@ -119,6 +213,41 @@ async function resolveAllMcpConfigs(userId, user) {
   }
 
   return await registry.getAllServerConfigs(userId, configServers);
+}
+
+function getServerCustomUserVars(userMCPAuthMap, serverName) {
+  return userMCPAuthMap?.[`${Constants.mcp_prefix}${serverName}`];
+}
+
+/**
+ * Best-effort early gate; the authoritative check is
+ * `assertResolvedRuntimeConfigAllowed` in `@librechat/api`, whose resolution
+ * this must mirror. Graph placeholders resolve later (async), so a URL still
+ * carrying one defers to the authoritative check instead of rejecting here.
+ */
+async function isEarlyDomainAllowed({
+  serverConfig,
+  user,
+  requestBody,
+  userMCPAuthMap,
+  serverName,
+  allowedDomains,
+  allowedAddresses,
+}) {
+  const validationConfig = processMCPEnv({
+    user,
+    body: requestBody,
+    dbSourced: isUserSourced(serverConfig),
+    options: serverConfig,
+    customUserVars: getServerCustomUserVars(userMCPAuthMap, serverName),
+  });
+  if (
+    typeof validationConfig?.url === 'string' &&
+    containsGraphTokenPlaceholder(validationConfig.url)
+  ) {
+    return true;
+  }
+  return await isMCPDomainAllowed(validationConfig, allowedDomains, allowedAddresses);
 }
 
 /**
@@ -161,26 +290,20 @@ function isEmptyObjectSchema(jsonSchema) {
  * @param {string} params.stepId - The ID of the step in the flow.
  * @param {ToolCallChunk} params.toolCall - The tool call object containing tool information.
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  */
-function createRunStepDeltaEmitter({ res, stepId, toolCall, streamId = null }) {
+function createRunStepDeltaEmitter({ res, stepId, toolCall, streamId = null, jobCreatedAt }) {
   /**
    * @param {string} authURL - The URL to redirect the user for OAuth authentication.
+   * @param {{ expiresAt?: number }} [options]
    * @returns {Promise<void>}
    */
-  return async function (authURL) {
-    /** @type {{ id: string; delta: AgentToolCallDelta }} */
-    const data = {
-      id: stepId,
-      delta: {
-        type: StepTypes.TOOL_CALLS,
-        tool_calls: [{ ...toolCall, args: '' }],
-        auth: authURL,
-        expires_at: Date.now() + Time.TWO_MINUTES,
-      },
-    };
-    const eventData = { event: GraphEvents.ON_RUN_STEP_DELTA, data };
+  return async function (authURL, options) {
+    const eventData = buildMCPAuthRunStepDeltaEvent({ authURL, stepId, toolCall, options });
     if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData);
+      await GenerationJobManager.emitChunk(streamId, eventData, {
+        expectedCreatedAt: jobCreatedAt,
+      });
     } else {
       sendEvent(res, eventData);
     }
@@ -195,24 +318,24 @@ function createRunStepDeltaEmitter({ res, stepId, toolCall, streamId = null }) {
  * @param {ToolCallChunk} params.toolCall - The tool call object containing tool information.
  * @param {number} [params.index]
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @returns {() => Promise<void>}
  */
-function createRunStepEmitter({ res, runId, stepId, toolCall, index, streamId = null }) {
+function createRunStepEmitter({
+  res,
+  runId,
+  stepId,
+  toolCall,
+  index,
+  streamId = null,
+  jobCreatedAt,
+}) {
   return async function () {
-    /** @type {import('@librechat/agents').RunStep} */
-    const data = {
-      runId: runId ?? Constants.USE_PRELIM_RESPONSE_MESSAGE_ID,
-      id: stepId,
-      type: StepTypes.TOOL_CALLS,
-      index: index ?? 0,
-      stepDetails: {
-        type: StepTypes.TOOL_CALLS,
-        tool_calls: [toolCall],
-      },
-    };
-    const eventData = { event: GraphEvents.ON_RUN_STEP, data };
+    const eventData = buildMCPAuthRunStepEvent({ runId, stepId, toolCall, index });
     if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData);
+      await GenerationJobManager.emitChunk(streamId, eventData, {
+        expectedCreatedAt: jobCreatedAt,
+      });
     } else {
       sendEvent(res, eventData);
     }
@@ -224,20 +347,43 @@ function createRunStepEmitter({ res, runId, stepId, toolCall, index, streamId = 
  * @param {object} params
  * @param {string} params.flowId - The ID of the login flow.
  * @param {FlowStateManager<any>} params.flowManager - The flow manager instance.
- * @param {(authURL: string) => void} [params.callback]
+ * @param {(authURL: string, options?: { expiresAt?: number }) => void | Promise<void>} [params.callback]
  */
 function createOAuthStart({ flowId, flowManager, callback }) {
   /**
    * Creates a function to handle OAuth login requests.
    * @param {string} authURL - The URL to redirect the user for OAuth authentication.
+   * @param {{ expiresAt?: number }} [options]
    * @returns {Promise<boolean>} Returns true to indicate the event was sent successfully.
    */
-  return async function (authURL) {
+  return async function (authURL, options) {
+    let emitted = false;
+    const emitOAuthStart = async (message) => {
+      if (options) {
+        await callback?.(authURL, options);
+      } else {
+        await callback?.(authURL);
+      }
+      emitted = true;
+      logger.debug(message);
+    };
+
+    const existingFlow = await flowManager.getFlowState(flowId, 'oauth_login');
+    if (existingFlow) {
+      await emitOAuthStart('Re-sent OAuth login request to client');
+      return true;
+    }
+
     await flowManager.createFlowWithHandler(flowId, 'oauth_login', async () => {
-      callback?.(authURL);
-      logger.debug('Sent OAuth login request to client');
+      await emitOAuthStart('Sent OAuth login request to client');
       return true;
     });
+
+    if (!emitted) {
+      await emitOAuthStart('Re-sent OAuth login request to client');
+    }
+
+    return true;
   };
 }
 
@@ -247,20 +393,15 @@ function createOAuthStart({ flowId, flowManager, callback }) {
  * @param {string} params.stepId - The ID of the step in the flow.
  * @param {ToolCallChunk} params.toolCall - The tool call object containing tool information.
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  */
-function createOAuthEnd({ res, stepId, toolCall, streamId = null }) {
+function createOAuthEnd({ res, stepId, toolCall, streamId = null, jobCreatedAt }) {
   return async function () {
-    /** @type {{ id: string; delta: AgentToolCallDelta }} */
-    const data = {
-      id: stepId,
-      delta: {
-        type: StepTypes.TOOL_CALLS,
-        tool_calls: [{ ...toolCall }],
-      },
-    };
-    const eventData = { event: GraphEvents.ON_RUN_STEP_DELTA, data };
+    const eventData = buildMCPAuthRunStepEndDeltaEvent({ stepId, toolCall });
     if (streamId) {
-      await GenerationJobManager.emitChunk(streamId, eventData);
+      await GenerationJobManager.emitChunk(streamId, eventData, {
+        expectedCreatedAt: jobCreatedAt,
+      });
     } else {
       sendEvent(res, eventData);
     }
@@ -273,12 +414,13 @@ function createOAuthEnd({ res, stepId, toolCall, streamId = null }) {
  * @param {string} params.userId - The ID of the user.
  * @param {string} params.serverName - The name of the server.
  * @param {string} params.toolName - The name of the tool.
+ * @param {string} [params.tenantId] - The tenant ID for the current request.
  * @param {FlowStateManager<any>} params.flowManager - The flow manager instance.
  */
-function createAbortHandler({ userId, serverName, toolName, flowManager }) {
+function createAbortHandler({ userId, serverName, toolName, tenantId, flowManager }) {
   return function () {
     logger.info(`[MCP][User: ${userId}][${serverName}][${toolName}] Tool call aborted`);
-    const flowId = MCPOAuthHandler.generateFlowId(userId, serverName);
+    const flowId = getOAuthFlowId(userId, serverName, tenantId);
     // Clean up both mcp_oauth and mcp_get_tokens flows
     flowManager.failFlow(flowId, 'mcp_oauth', new Error('Tool call aborted'));
     flowManager.failFlow(flowId, 'mcp_get_tokens', new Error('Tool call aborted'));
@@ -287,14 +429,14 @@ function createAbortHandler({ userId, serverName, toolName, flowManager }) {
 
 /**
  * @param {Object} params
- * @param {() => void} params.runStepEmitter
- * @param {(authURL: string) => void} params.runStepDeltaEmitter
- * @returns {(authURL: string) => void}
+ * @param {() => Promise<void>} params.runStepEmitter
+ * @param {(authURL: string, options?: { expiresAt?: number }) => Promise<void>} params.runStepDeltaEmitter
+ * @returns {(authURL: string, options?: { expiresAt?: number }) => Promise<void>}
  */
 function createOAuthCallback({ runStepEmitter, runStepDeltaEmitter }) {
-  return function (authURL) {
-    runStepEmitter();
-    runStepDeltaEmitter(authURL);
+  return async function (authURL, options) {
+    await runStepEmitter();
+    await runStepDeltaEmitter(authURL, options);
   };
 }
 
@@ -307,7 +449,10 @@ function createOAuthCallback({ runStepEmitter, runStepDeltaEmitter }) {
  * @param {string} params.model
  * @param {number} [params.index]
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
+ * @param {import('@librechat/api').RequestScopedMCPConnectionStore} [params.requestScopedConnections]
+ * @param {import('@librechat/api').ParsedServerConfig} [params.serverConfig] - Used to bypass reconnect throttling for request-scoped servers.
  * @returns { Promise<Array<typeof tool | { _call: (toolInput: Object | string) => unknown}>> } An object with `_call` method to execute the tool input.
  */
 async function reconnectServer({
@@ -316,36 +461,45 @@ async function reconnectServer({
   index,
   signal,
   serverName,
+  serverConfig,
   configServers,
   userMCPAuthMap,
+  requestBody,
+  requestScopedConnections,
   streamId = null,
+  jobCreatedAt,
 }) {
   logger.debug(
     `[MCP][reconnectServer] serverName: ${serverName}, user: ${user?.id}, hasUserMCPAuthMap: ${!!userMCPAuthMap}`,
   );
 
-  const throttleKey = `${user.id}:${serverName}`;
-  const now = Date.now();
-  const lastAttempt = lastReconnectAttempts.get(throttleKey) ?? 0;
-  if (now - lastAttempt < RECONNECT_THROTTLE_MS) {
-    logger.debug(`[MCP][reconnectServer] Throttled reconnect for ${serverName}`);
-    return null;
+  // Request-scoped servers reconnect on every message by design; throttling them
+  // would stub out healthy tools for messages sent within the throttle window.
+  const requestScoped = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
+  if (!requestScoped) {
+    const throttleKey = `${user.id}:${serverName}`;
+    const now = Date.now();
+    const lastAttempt = lastReconnectAttempts.get(throttleKey) ?? 0;
+    if (now - lastAttempt < RECONNECT_THROTTLE_MS) {
+      logger.debug(`[MCP][reconnectServer] Throttled reconnect for ${serverName}`);
+      return null;
+    }
+    lastReconnectAttempts.set(throttleKey, now);
+    evictStale(lastReconnectAttempts, RECONNECT_THROTTLE_MS);
   }
-  lastReconnectAttempts.set(throttleKey, now);
-  evictStale(lastReconnectAttempts, RECONNECT_THROTTLE_MS);
 
   const runId = Constants.USE_PRELIM_RESPONSE_MESSAGE_ID;
   const flowId = `${user.id}:${serverName}:${Date.now()}`;
   const flowManager = getFlowStateManager(getLogStores(CacheKeys.FLOWS));
-  const stepId = 'step_oauth_login_' + serverName;
-  const toolCall = {
+  const stepId = buildMCPAuthStepId(serverName);
+  const toolCall = buildMCPAuthToolCall({
     id: flowId,
-    name: buildOAuthToolCallName(serverName),
-    type: 'tool_call_chunk',
-  };
+    serverName,
+  });
 
   // Set up abort handler to clean up OAuth flows if request is aborted
-  const oauthFlowId = MCPOAuthHandler.generateFlowId(user.id, serverName);
+  const tenantId = user?.tenantId ?? getTenantId();
+  const oauthFlowId = getOAuthFlowId(user.id, serverName, tenantId);
   const abortHandler = () => {
     logger.info(
       `[MCP][User: ${user.id}][${serverName}] Tool loading aborted, cleaning up OAuth flows`,
@@ -367,12 +521,14 @@ async function reconnectServer({
       stepId,
       toolCall,
       streamId,
+      jobCreatedAt,
     });
     const runStepDeltaEmitter = createRunStepDeltaEmitter({
       res,
       stepId,
       toolCall,
       streamId,
+      jobCreatedAt,
     });
     const callback = createOAuthCallback({ runStepEmitter, runStepDeltaEmitter });
     const oauthStart = createOAuthStart({
@@ -389,6 +545,8 @@ async function reconnectServer({
       oauthStart,
       flowManager,
       userMCPAuthMap,
+      requestBody,
+      requestScopedConnections,
       forceNew: true,
       returnOnOAuth: false,
       connectionTimeout: Time.THIRTY_SECONDS,
@@ -409,6 +567,7 @@ async function reconnectServer({
  *
  * @param {Object} params
  * @param {ServerResponse} params.res - The Express response object for sending events.
+ * @param {{ canUseServers: (user?: IUser) => Promise<boolean> }} [params.mcpPermissionContext] - Request-scoped MCP permission context.
  * @param {IUser} params.user - The user from the request object.
  * @param {string} params.serverName
  * @param {string} params.model
@@ -416,12 +575,16 @@ async function reconnectServer({
  * @param {number} [params.index]
  * @param {AbortSignal} [params.signal]
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @param {import('@librechat/api').ParsedServerConfig} [params.config]
+ * @param {import('@librechat/api').RequestBody} [params.requestBody]
+ * @param {import('@librechat/api').RequestScopedMCPConnectionStore} [params.requestScopedConnections]
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
  * @returns { Promise<Array<typeof tool | { _call: (toolInput: Object | string) => unknown}>> } An object with `_call` method to execute the tool input.
  */
 async function createMCPTools({
   res,
+  mcpPermissionContext,
   user,
   index,
   signal,
@@ -430,10 +593,14 @@ async function createMCPTools({
   serverName,
   configServers,
   userMCPAuthMap,
+  requestBody,
+  requestScopedConnections,
   streamId = null,
+  jobCreatedAt,
 }) {
   const serverConfig =
     config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+
   if (serverConfig?.url) {
     const appConfig = await getAppConfig({
       role: user?.role,
@@ -442,11 +609,15 @@ async function createMCPTools({
     });
     const allowedDomains = appConfig?.mcpSettings?.allowedDomains;
     const allowedAddresses = appConfig?.mcpSettings?.allowedAddresses;
-    const isDomainAllowed = await isMCPDomainAllowed(
+    const isDomainAllowed = await isEarlyDomainAllowed({
       serverConfig,
+      user,
+      requestBody,
+      userMCPAuthMap,
+      serverName,
       allowedDomains,
       allowedAddresses,
-    );
+    });
     if (!isDomainAllowed) {
       logger.warn(`[MCP][${serverName}] Domain not allowed, skipping all tools`);
       return [];
@@ -459,9 +630,13 @@ async function createMCPTools({
     index,
     signal,
     serverName,
+    serverConfig,
     configServers,
     userMCPAuthMap,
+    requestBody,
+    requestScopedConnections,
     streamId,
+    jobCreatedAt,
   });
   if (result === null) {
     logger.debug(`[MCP][${serverName}] Reconnect throttled, skipping tool creation.`);
@@ -476,13 +651,18 @@ async function createMCPTools({
   for (const tool of result.tools) {
     const toolInstance = await createMCPTool({
       res,
+      mcpPermissionContext,
       user,
       provider,
       userMCPAuthMap,
       configServers,
       streamId,
+      jobCreatedAt,
       availableTools: result.availableTools,
+      serverName,
       toolKey: `${tool.name}${Constants.mcp_delimiter}${serverName}`,
+      requestBody,
+      requestScopedConnections,
       config: serverConfig,
     });
     if (toolInstance) {
@@ -497,6 +677,7 @@ async function createMCPTools({
  * Creates a single tool from the specified MCP Server via `toolKey`.
  * @param {Object} params
  * @param {ServerResponse} params.res - The Express response object for sending events.
+ * @param {{ canUseServers: (user?: IUser) => Promise<boolean> }} [params.mcpPermissionContext] - Request-scoped MCP permission context.
  * @param {IUser} params.user - The user from the request object.
  * @param {string} params.toolKey - The toolKey for the tool.
  * @param {string} params.model - The model for the tool.
@@ -505,12 +686,17 @@ async function createMCPTools({
  * @param {string | null} [params.streamId] - The stream ID for resumable mode.
  * @param {Providers | EModelEndpoint} params.provider - The provider for the tool.
  * @param {LCAvailableTools} [params.availableTools]
+ * @param {import('@librechat/api').RequestBody} [params.requestBody]
+ * @param {import('@librechat/api').RequestScopedMCPConnectionStore} [params.requestScopedConnections]
  * @param {Record<string, Record<string, string>>} [params.userMCPAuthMap]
  * @param {import('@librechat/api').ParsedServerConfig} [params.config]
+ * @param {(availableTools: LCAvailableTools) => void} [params.onAvailableTools]
+ * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted events.
  * @returns { Promise<typeof tool | { _call: (toolInput: Object | string) => unknown}> } An object with `_call` method to execute the tool input.
  */
 async function createMCPTool({
   res,
+  mcpPermissionContext,
   user,
   index,
   signal,
@@ -518,14 +704,32 @@ async function createMCPTool({
   provider,
   userMCPAuthMap,
   availableTools,
+  requestBody,
+  requestScopedConnections,
   config,
   configServers,
+  serverName: resolvedServerName,
+  onAvailableTools,
   streamId = null,
+  jobCreatedAt,
 }) {
-  const [toolName, serverName] = toolKey.split(Constants.mcp_delimiter);
+  /** `loadTools` already resolved the server for this key; parsing is the fallback. */
+  const [parsedToolName, parsedServerName] = splitMCPToolKey(
+    toolKey,
+    /** Tool keys embed the normalized server name, so the candidate list must be
+     *  normalized too or a name needing normalization never matches. */
+    resolvedServerName
+      ? [normalizeServerName(resolvedServerName)]
+      : Object.keys(configServers ?? {}).map(normalizeServerName),
+  );
+  const serverName = resolvedServerName ?? parsedServerName;
+  const toolName = parsedToolName;
 
   const serverConfig =
     config ?? (await getMCPServersRegistry().getServerConfig(serverName, user?.id, configServers));
+  const requestScopedTools = serverConfig ? requiresEphemeralUserConnection(serverConfig) : false;
+  const useMissingToolCache = !requestScopedTools;
+
   if (serverConfig?.url) {
     const appConfig = await getAppConfig({
       role: user?.role,
@@ -534,11 +738,15 @@ async function createMCPTool({
     });
     const allowedDomains = appConfig?.mcpSettings?.allowedDomains;
     const allowedAddresses = appConfig?.mcpSettings?.allowedAddresses;
-    const isDomainAllowed = await isMCPDomainAllowed(
+    const isDomainAllowed = await isEarlyDomainAllowed({
       serverConfig,
+      user,
+      requestBody,
+      userMCPAuthMap,
+      serverName,
       allowedDomains,
       allowedAddresses,
-    );
+    });
     if (!isDomainAllowed) {
       logger.warn(`[MCP][${serverName}] Domain no longer allowed, skipping tool: ${toolName}`);
       return undefined;
@@ -548,7 +756,7 @@ async function createMCPTool({
   /** @type {LCTool | undefined} */
   let toolDefinition = availableTools?.[toolKey]?.function;
   if (!toolDefinition) {
-    const cachedAt = missingToolCache.get(toolKey);
+    const cachedAt = useMissingToolCache ? missingToolCache.get(toolKey) : undefined;
     if (cachedAt && Date.now() - cachedAt < MISSING_TOOL_TTL_MS) {
       logger.debug(
         `[MCP][${serverName}][${toolName}] Tool in negative cache, returning unavailable stub.`,
@@ -565,13 +773,20 @@ async function createMCPTool({
       index,
       signal,
       serverName,
+      serverConfig,
       configServers,
       userMCPAuthMap,
+      requestBody,
+      requestScopedConnections,
       streamId,
+      jobCreatedAt,
     });
+    if (result?.availableTools) {
+      onAvailableTools?.(result.availableTools);
+    }
     toolDefinition = result?.availableTools?.[toolKey]?.function;
 
-    if (!toolDefinition) {
+    if (!toolDefinition && useMissingToolCache) {
       missingToolCache.set(toolKey, Date.now());
       evictStale(missingToolCache, MISSING_TOOL_TTL_MS);
     }
@@ -586,29 +801,45 @@ async function createMCPTool({
 
   return createToolInstance({
     res,
+    mcpPermissionContext,
+    user,
+    requestBody,
+    requestScopedConnections,
     provider,
     toolName,
     serverName,
     serverConfig,
     toolDefinition,
     streamId,
+    jobCreatedAt,
   });
 }
 
 function createToolInstance({
   res,
+  mcpPermissionContext,
+  user: capturedUser = null,
+  requestBody: capturedRequestBody,
+  requestScopedConnections: capturedRequestScopedConnections,
   toolName,
   serverName,
   serverConfig: capturedServerConfig,
   toolDefinition,
   provider: capturedProvider,
   streamId = null,
+  jobCreatedAt,
 }) {
   /** @type {LCTool} */
   const { description, parameters } = toolDefinition;
   const isGoogle = capturedProvider === Providers.VERTEXAI || capturedProvider === Providers.GOOGLE;
 
   let schema = parameters ? normalizeJsonSchema(resolveJsonSchemaRefs(parameters)) : null;
+
+  if (schema && isGoogle) {
+    // Gemini/Vertex AI accept only a subset of JSON Schema; sanitize so MCP tools with
+    // unions, non-string enums, etc. don't 400 (they work as-is on OpenAI/Claude).
+    schema = sanitizeGeminiSchema(schema);
+  }
 
   if (!schema || (isGoogle && isEmptyObjectSchema(schema))) {
     schema = {
@@ -624,18 +855,26 @@ function createToolInstance({
 
   /** @type {(toolArguments: Object | string, config?: GraphRunnableConfig) => Promise<unknown>} */
   const _call = async (toolArguments, config) => {
-    const userId = config?.configurable?.user?.id || config?.configurable?.user_id;
+    const effectiveUser = config?.configurable?.user ?? capturedUser;
+    const permissionUser = effectiveUser;
+    const userId = effectiveUser?.id || config?.configurable?.user_id || capturedUser?.id;
     /** @type {ReturnType<typeof createAbortHandler>} */
     let abortHandler = null;
     /** @type {AbortSignal} */
     let derivedSignal = null;
 
     try {
+      const provider = (config?.metadata?.provider || capturedProvider)?.toLowerCase();
+      const canUseMCP = mcpPermissionContext
+        ? await mcpPermissionContext.canUseServers(permissionUser)
+        : await userCanUseMCPServers(permissionUser);
+      if (!canUseMCP) {
+        throw new Error('Forbidden: Insufficient MCP server permissions');
+      }
       const flowsCache = getLogStores(CacheKeys.FLOWS);
       const flowManager = getFlowStateManager(flowsCache);
       derivedSignal = config?.signal ? AbortSignal.any([config.signal]) : undefined;
       const mcpManager = getMCPManager(userId);
-      const provider = (config?.metadata?.provider || capturedProvider)?.toLowerCase();
 
       const { args: _args, stepId, ...toolCall } = config.toolCall ?? {};
       const flowId = `${serverName}:oauth_login:${config.metadata.thread_id}:${config.metadata.run_id}`;
@@ -644,6 +883,7 @@ function createToolInstance({
         stepId,
         toolCall,
         streamId,
+        jobCreatedAt,
       });
       const oauthStart = createOAuthStart({
         flowId,
@@ -655,10 +895,12 @@ function createToolInstance({
         stepId,
         toolCall,
         streamId,
+        jobCreatedAt,
       });
 
       if (derivedSignal) {
-        abortHandler = createAbortHandler({ userId, serverName, toolName, flowManager });
+        const tenantId = config?.configurable?.user?.tenantId ?? getTenantId();
+        abortHandler = createAbortHandler({ userId, serverName, toolName, tenantId, flowManager });
         derivedSignal.addEventListener('abort', abortHandler, { once: true });
       }
 
@@ -674,8 +916,10 @@ function createToolInstance({
         options: {
           signal: derivedSignal,
         },
-        user: config?.configurable?.user,
-        requestBody: config?.configurable?.requestBody,
+        user: effectiveUser,
+        requestBody: config?.configurable?.requestBody ?? capturedRequestBody,
+        requestScopedConnections:
+          config?.configurable?.requestScopedConnections ?? capturedRequestScopedConnections,
         customUserVars,
         flowManager,
         tokenMethods: {
@@ -687,6 +931,8 @@ function createToolInstance({
         oauthStart,
         oauthEnd,
         graphTokenResolver: getGraphApiToken,
+        oboTokenResolver: exchangeOboToken,
+        oboTrustChecker: createOboTrustChecker(),
       });
 
       if (isAssistantsEndpoint(provider) && Array.isArray(result)) {
@@ -731,7 +977,17 @@ function createToolInstance({
   });
   toolInstance.mcp = true;
   toolInstance.mcpRawServerName = serverName;
-  toolInstance.mcpJsonSchema = parameters;
+  // Ephemeral request-scoped servers (runtime body placeholders) tear their
+  // connection down at request end, so they must never be backgrounded. A
+  // missing/stale config means the server's lifetime is unknowable, so fail
+  // closed (foreground) rather than risk a detached call against a torn-down
+  // connection.
+  toolInstance.mcpRequiresEphemeralConnection = capturedServerConfig
+    ? requiresEphemeralUserConnection(capturedServerConfig)
+    : true;
+  // On Google/Vertex, propagate the union-flattened schema so definitions extracted
+  // from this instance don't reach the Gemini converter with unsupported unions.
+  toolInstance.mcpJsonSchema = isGoogle ? schema : parameters;
   return toolInstance;
 }
 
@@ -781,12 +1037,13 @@ async function getMCPSetupData(userId, options = {}) {
  * Check OAuth flow status for a user and server
  * @param {string} userId - The user ID
  * @param {string} serverName - The server name
+ * @param {string} [tenantId] - The tenant ID for the current request.
  * @returns {Object} Object containing hasActiveFlow and hasFailedFlow flags
  */
-async function checkOAuthFlowStatus(userId, serverName) {
+async function checkOAuthFlowStatus(userId, serverName, tenantId = getTenantId()) {
   const flowsCache = getLogStores(CacheKeys.FLOWS);
   const flowManager = getFlowStateManager(flowsCache);
-  const flowId = MCPOAuthHandler.generateFlowId(userId, serverName);
+  const flowId = getOAuthFlowId(userId, serverName, tenantId);
 
   try {
     const flowState = await flowManager.getFlowState(flowId, 'mcp_oauth');
@@ -795,7 +1052,10 @@ async function checkOAuthFlowStatus(userId, serverName) {
     }
 
     const flowAge = Date.now() - flowState.createdAt;
-    const flowTTL = flowState.ttl || 180000; // Default 3 minutes
+    // Report active only while the flow is still usable (the handling/reuse window),
+    // not for the full Keyv retention TTL — otherwise the UI shows "connecting" for a
+    // flow the initiate/callback paths already reject, hiding the connect button.
+    const flowTTL = flowState.ttl || PENDING_STALE_MS;
 
     if (flowState.status === 'FAILED' || flowAge > flowTTL) {
       const wasCancelled = flowState.error && flowState.error.includes('cancelled');
@@ -888,10 +1148,15 @@ async function getServerConnectionStatus(
 module.exports = {
   createMCPTool,
   createMCPTools,
+  createMCPPermissionContext,
+  userCanUseMCPServers,
   getMCPSetupData,
   resolveConfigServers,
+  resolveMcpServerNames,
+  resolveMcpServerContext,
   resolveMcpConfigNames,
   resolveAllMcpConfigs,
+  createOAuthStart,
   checkOAuthFlowStatus,
   getServerConnectionStatus,
   createUnavailableToolStub,

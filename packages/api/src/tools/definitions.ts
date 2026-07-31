@@ -5,11 +5,12 @@
  * @module packages/api/src/tools/definitions
  */
 
-import { Constants, isActionTool } from 'librechat-data-provider';
-import type { AgentToolOptions } from 'librechat-data-provider';
+import { Providers } from '@librechat/agents';
+import { Constants, isActionTool, splitMCPToolKey } from 'librechat-data-provider';
 import type { LCToolRegistry, JsonSchemaType, LCTool, GenericTool } from '@librechat/agents';
+import type { AgentToolOptions } from 'librechat-data-provider';
 import type { ToolDefinition } from './classification';
-import { resolveJsonSchemaRefs, normalizeJsonSchema } from '~/mcp/zod';
+import { resolveJsonSchemaRefs, normalizeJsonSchema, sanitizeGeminiSchema } from '~/mcp/zod';
 import { buildToolClassification } from './classification';
 import { getToolDefinition } from './registry/definitions';
 import { toolkitExpansion } from './toolkits/mapping';
@@ -39,6 +40,10 @@ export interface LoadToolDefinitionsParams {
   programmaticToolsEnabled?: boolean;
   /** Whether code execution is enabled and requested by this agent */
   codeExecutionEnabled?: boolean;
+  /** Agent provider — Gemini/Vertex tool schemas get union-flattened for compatibility */
+  provider?: Providers;
+  /** Configured server names, used to resolve the tool-key boundary exactly */
+  mcpServerNames?: readonly string[];
 }
 
 export interface ActionToolDefinition {
@@ -83,8 +88,21 @@ export async function loadToolDefinitions(
     deferredToolsEnabled = false,
     programmaticToolsEnabled = false,
     codeExecutionEnabled = false,
+    provider,
+    mcpServerNames,
   } = params;
   const { getOrFetchMCPServerTools, isBuiltInTool, getActionToolDefinitions } = deps;
+
+  const isGoogle = provider === Providers.GOOGLE || provider === Providers.VERTEXAI;
+
+  /** Normalizes MCP tool params, additionally union-flattening for the Gemini/Vertex path. */
+  const buildMcpParameters = (mcpParams?: JsonSchemaType): JsonSchemaType | undefined => {
+    if (!mcpParams) {
+      return undefined;
+    }
+    const normalized = normalizeJsonSchema(resolveJsonSchemaRefs(mcpParams));
+    return isGoogle ? sanitizeGeminiSchema(normalized) : normalized;
+  };
 
   const emptyResult: LoadToolDefinitionsResult = {
     toolDefinitions: [],
@@ -140,8 +158,8 @@ export async function loadToolDefinitions(
       continue;
     }
 
-    const parts = toolName.split(Constants.mcp_delimiter);
-    const serverName = parts[parts.length - 1];
+    const [, parsedServerName] = splitMCPToolKey(toolName, mcpServerNames);
+    const serverName = parsedServerName ?? toolName;
 
     if (!mcpServerToolsCache.has(serverName)) {
       const serverTools = await getOrFetchMCPServerTools(userId, serverName);
@@ -159,9 +177,7 @@ export async function loadToolDefinitions(
           mcpToolDefs.push({
             name: actualToolName,
             description: toolDef.function.description || undefined,
-            parameters: toolDef.function.parameters
-              ? normalizeJsonSchema(resolveJsonSchemaRefs(toolDef.function.parameters))
-              : undefined,
+            parameters: buildMcpParameters(toolDef.function.parameters),
             serverName,
           });
         }
@@ -174,9 +190,7 @@ export async function loadToolDefinitions(
       mcpToolDefs.push({
         name: toolName,
         description: toolDef.function.description || undefined,
-        parameters: toolDef.function.parameters
-          ? normalizeJsonSchema(resolveJsonSchemaRefs(toolDef.function.parameters))
-          : undefined,
+        parameters: buildMcpParameters(toolDef.function.parameters),
         serverName,
       });
     }
@@ -196,11 +210,13 @@ export async function loadToolDefinitions(
     description: def.description,
     mcp: true as const,
     mcpJsonSchema: def.parameters,
+    mcpRawServerName: def.serverName,
   })) as unknown as GenericTool[];
 
   const classificationResult = await buildToolClassification({
     userId,
     agentId,
+    provider,
     loadedTools,
     deferredToolsEnabled,
     programmaticToolsEnabled,
